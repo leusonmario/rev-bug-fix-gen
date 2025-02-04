@@ -8,6 +8,10 @@ from langchain.memory import ConversationBufferMemory
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import OpenAI, ChatOpenAI
 from unidiff import PatchSet
+import csv
+import sys
+
+csv.field_size_limit(sys.maxsize)
 
 import config
 
@@ -39,6 +43,39 @@ CODE_SUMMARIZATION_DIFF = """
     {patch_bug}
     
     And now, you can find the patch_fix:
+    {patch_fix}
+    """
+
+FILTERING_COMMENTS = """
+    You are an expert reviewer with extensive experience in source code reviews.
+
+    Please analyze the comments below and, based on patch_fixing_the_bug, filter out any comments that are not related to the changes in patch_fixing_the_bug or the issue it addresses. 
+    Note that some comments may reference files not directly modified in patch_fixing_the_bug but could still be relevant if they are logically connected to the addressed issue.
+    
+    Apply the following filters:
+    1. Remove comments that focus on documentation, comments, error handling, or requests for tests.
+    2. Remove comments that suggest developers double-check their implementations (e.g., verifying the existence, initialization, or creation of objects, methods, or files) without providing actionable feedback.
+    3. Remove comments that are purely descriptive and do not suggest improvements or highlight problems.
+    4. Remove comments that are solely praising (e.g., "This is a good addition to the code.").
+    5. Consolidate duplicate comments that address the same issue into a single, comprehensive comment.
+    
+    At the end, return a single JSON file containing the valid comments. 
+    Ensure the output format matches the example below:
+    
+    Example:
+    ```json
+    [
+        {{
+            "filename": "netwerk/streamconv/converters/mozTXTToHTMLConv.cpp",
+            "start_line": 1211,
+            "content": "Ensure that the size of `tempString` does not exceed 256 characters. Using `nsAutoStringN<256>` is efficient for small strings, but exceeding the size can lead to buffer issues."
+        }}
+    ]
+    
+    Below, you can find the comments:
+    {comments}
+
+    And now, you can find the patch_fixing_the_bug:
     {patch_fix}
     """
 
@@ -79,31 +116,49 @@ CODE_GEN = """
     
     """
 
-CODE_GEN_BUG_FIX = """
-    Now, you're asked to generate code review comments for the patch_bug, aiming to avoid the occurrence of the reported bug. 
-    This way, based on the changes applied to the patch_fix, you have to raise comments that could be associated with the previous patch_bug. 
-    These comments should guide developers to fix the bug in advance focusing on the code changes. Do not consider added comments.  
+#This way, based on the changes applied to the patch_fix, you have to raise comments that could be associated with the previous patch_bug.
 
-    1. Understand the changes done in the patch by reasoning about the patch and bug summarization as previously reported.
-    2. Identify possible code snippets that might associated with the issues raised in the bug summarization and similar concerns.
-    3. Reason about each identified problem to make sure they are valid and cover the issues raised in the bug summarization. Have in mind, your review must be consistent with the source code in Mozilla.
-    4. Filter out comments that focuses on documentation, comments, error handling, tests, and confirmation whether objects, methods and files exist or not.
-    5. Filter out comments that are descriptive.
-    6. Filter out comments that are praising (example: "This is a good addition to the code.").
-    7. Filter out comments that are not about added lines (have '+' symbol at the start of the line).
-    8. Final answer: Write down the comments and report them using the JSON format previously adopted for the valid comment examples.
+CODE_GEN_BUG_FIX = """
+    Now, you're asked to generate code review comments for the patch_introducing_the_bug, aiming to avoid the occurrence of the reported bug. 
+    
+    Guidelines:
+    1. **Objective**: Identify changes in patch_introducing_the_bug that caused the bug and provide actionable feedback to prevent it.
+    2. **Reference**: Use patch_fixing_the_bug only to identify the bug’s cause. Do not reference patch_fixing_the_bug explicitly in your comments.
+    3. **Exclusions**:
+       - Do not comment on unrelated changes (changes not addressing the bug).
+       - Only consider added lines (lines starting with `+` in patch_introducing_the_bug).
+    4. **Context**: Align your review with the issues raised in the bug summarization and Mozilla's source code guidelines.
+    5. **Format**: Write comments in the following JSON format:
+       ```json
+       [
+           {{
+               \"filename\": \"<file_path>\",
+               \"start_line\": <line_number>,
+               \"content\": \"<comment_content>\"
+           }}
+       ] 
+       ```
+       
+    Steps:
+    1. Analyze the changes in patch_introducing_the_bug and the bug summarization.
+    2. Identify potential issues in patch_bug that are addressed in patch_fixing_the_bug.
+    3. Validate each identified problem to ensure it is valid and consistent with the bug summarization.
+    4. Exclude comments for changes unrelated to the bug or not in added lines.
+    5. Write actionable and concise comments, focusing on code changes, in the JSON format.
     
     As an example, consider:
-    comment: 
-        "filename": "netwerk/streamconv/converters/mozTXTToHTMLConv.cpp",
-        "start_line": 1211,
-        "content": "You are using `nsAutoStringN<256>` instead of `nsString`. This is a good change as `nsAutoStringN<256>` is more efficient for small strings. However, you should ensure that the size of `tempString` does not exceed 256 characters, as `nsAutoStringN<256>` has a fixed size."
-        
+    [
+        {{
+            \"filename\": \"netwerk/streamconv/converters/mozTXTToHTMLConv.cpp\",
+            \"start_line\": 1211,
+            \"content\": \"Consider validating the size of `tempString` to ensure it does not exceed 256 characters. Using `nsAutoStringN<256>` is efficient for small strings, but exceeding the size can lead to buffer issues.\"
+        }}
+    ]        
 
-    Below, you can find the patch_bug:
+    Below, you can find the patch_introducing_the_bug:
     {patch_bug}
     
-    And now, you can find the patch_fix:
+    And now, you can find the patch_fixing_the_bug:
     {patch_fix}
 
     """
@@ -147,6 +202,21 @@ def format_patch_set(patch_set):
         for hunk in patch:
             output += f"Filename: {patch.target_file}\n"
             output += f"{get_hunk_with_associated_lines(hunk)}\n"
+
+    return output
+
+def format_patch_set_filtered_files(patch_set, patch_fix):
+    modified_files = []
+
+    for patch_fix in patch_fix.modified_files:
+        modified_files.append(patch_fix.path)
+
+    output = ""
+    for patch in patch_set:
+        for hunk in patch:
+            if patch.path in modified_files:
+                output += f"Filename: {patch.target_file}\n"
+                output += f"{get_hunk_with_associated_lines(hunk)}\n"
 
     return output
 
@@ -231,15 +301,31 @@ def generate_comments(patch, bug_title, bug_description):
 
     return gen_comments
 
+def check_whether_target_file_is_changed_both_commits(patch_bug, patch_fix):
+    for changed_file_fix in patch_fix.modified_files:
+        for changed_file_bug in patch_bug.modified_files:
+            if changed_file_bug.path == changed_file_fix.path:
+                return True
+    return False
+
 def generate_comments_bug_fix(patch_bug, patch_fix, bug_title, bug_description):
     patch_set_bug = PatchSet.from_string(patch_bug)
     formatted_patch_bug = format_patch_set(patch_set_bug)
+
     if formatted_patch_bug == "":
         return None
 
     patch_set_fix = PatchSet.from_string(patch_fix)
     formatted_patch_fix = format_patch_set(patch_set_fix)
+
+    if check_whether_target_file_is_changed_both_commits(patch_set_bug, patch_set_fix) is False:
+        return None
+
     if formatted_patch_fix == "":
+        return None
+
+    formatted_patch_bug = format_patch_set_filtered_files(patch_set_bug, patch_set_fix)
+    if formatted_patch_bug == "":
         return None
 
     llm = ChatOpenAI(
@@ -252,6 +338,11 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_title, bug_description):
         llm=llm
     )
 
+    memory = ConversationBufferMemory()
+    conversation_chain = ConversationChain(
+        llm=llm,
+        memory=memory,
+    )
     bug_chain = None #LLMChain(
     #    prompt=PromptTemplate.from_template(BUG_SUMMARIZATION),
     #    llm=llm
@@ -265,12 +356,6 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_title, bug_description):
     output_summarization = summarization_chain.invoke(
         {"patch_bug": formatted_patch_bug, "patch_fix": formatted_patch_fix, },
     )["text"]
-
-    memory = ConversationBufferMemory()
-    conversation_chain = ConversationChain(
-        llm=llm,
-        memory=memory,
-    )
 
     memory.save_context(
         {
@@ -316,7 +401,16 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_title, bug_description):
         )
     )
 
-    return gen_comments
+    filtering = LLMChain(
+        prompt=PromptTemplate.from_template(FILTERING_COMMENTS),
+        llm=llm
+    )
+
+    filtered_comments = filtering.invoke(
+        {"patch_fix": formatted_patch_fix, "comments": gen_comments},
+        )["text"]
+
+    return filtered_comments
 
 
 import csv
@@ -324,7 +418,7 @@ import os
 import json
 
 
-def write_bug_info_to_csv(bug_id, bug_summary, comments_json):
+def write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, comments_json, interval_bug_fix):
     """
     Converts bug information and comments from JSON format to a CSV file.
 
@@ -333,7 +427,7 @@ def write_bug_info_to_csv(bug_id, bug_summary, comments_json):
     :param comments_json: A JSON-formatted string or list containing comment details.
     :param output_csv_path: The path to save the output CSV file.
     """
-    output_csv_path = os.path.join('output', 'output.csv')
+    output_csv_path = os.path.join('output', 'output-filtering_files_marco_suggestion_1_month_interval.csv')
     try:
         # If comments_json is a string, parse it into a Python list
         if isinstance(comments_json, str):
@@ -342,7 +436,7 @@ def write_bug_info_to_csv(bug_id, bug_summary, comments_json):
             comments = comments_json
 
         # Define the headers for the CSV file
-        headers = ["Bug ID", "Bug Summary", "Filename", "Start Line", "Comment Content"]
+        headers = ["Bug ID", "Bug Commit", "Fix ID", "Fix Commit", "Bug Summary", "Interval Bug-Fix", "Filename", "Start Line", "Comment Content"]
 
         if not os.path.exists(output_csv_path):
             with open(output_csv_path, mode='a+', newline='', encoding='utf-8') as csv_file:
@@ -357,7 +451,11 @@ def write_bug_info_to_csv(bug_id, bug_summary, comments_json):
             for comment in comments:
                 writer.writerow({
                     "Bug ID": bug_id,
+                    "Bug Commit": bug_commit,
+                    "Fix ID": fix_id,
+                    "Fix Commit": fix_commit,
                     "Bug Summary": bug_summary,
+                    "Interval Bug-Fix" : interval_bug_fix,
                     "Filename": comment.get("filename", ""),
                     "Start Line": comment.get("start_line", ""),
                     "Comment Content": comment.get("content", "")
@@ -408,8 +506,13 @@ def generate_output(bug_id, bug_summary, comments_json):
 
     print(f"CSV file saved at: {file_path}")
 
-import subprocess
-import sys
+import datetime
+
+def compare_commit_dates(bug_date, fix_date, interval_days: int) -> bool:
+
+    if bug_date and fix_date:
+        return (fix_date - bug_date).days <= interval_days
+    return False
 
 def get_diff(commit, repo_path):
     try:
@@ -509,26 +612,135 @@ def extract_and_parse_json(input_string):
     except json.JSONDecodeError as e:
         raise ValueError(f"Failed to parse JSON: {e}")
 
+from datetime import datetime, timedelta
+
+def is_a_recent_bug(creation_date: str, diff_year: int) -> bool:
+    try:
+        # Parse the creation date from the string
+        bug_date = datetime.strptime(creation_date, "%Y-%m-%dT%H:%M:%SZ")
+
+        # Calculate the date two years ago from today
+        supported_date = datetime.utcnow() - timedelta(days=diff_year*365)
+
+        # Check if the bug was created within the last two years
+        return bug_date >= supported_date
+    except ValueError:
+        # Return False if the date format is invalid
+        return False
+
+def is_fix_within_expected_interval(report_date: str, fix_date: str, interval: int) -> bool:
+    try:
+        # Parse the report and fix dates from the strings
+        report_datetime = datetime.strptime(report_date, "%Y-%m-%dT%H:%M:%SZ")
+        fix_datetime = datetime.strptime(fix_date, "%Y-%m-%dT%H:%M:%SZ")
+
+        # Calculate the six-month threshold
+        six_months_after_report = report_datetime + timedelta(days=30*interval)  # Approximate six months as 180 days
+
+        # Check if the fix date is within six months of the report date
+        if fix_datetime <= six_months_after_report and fix_datetime > report_datetime:
+            return True
+        else:
+            return False
+    except ValueError:
+        # Return False if the date format is invalid
+        return False
+
+import subprocess
+from datetime import datetime, timedelta
+from dateutil import parser, tz
+
+def get_commit_date(commit_hash, repo_path='.'):
+    try:
+        # Run the hg log command to get the commit date
+        result = subprocess.run(
+            ["hg", "log", "-r", commit_hash, "--template", "{date|isodate}"],
+            cwd=repo_path,
+            text=True,
+            capture_output=True,
+            check=True
+        )
+        commit_date_str = result.stdout.strip()
+        # Use dateutil.parser to parse the date string with timezone
+        commit_date = parser.parse(commit_date_str)
+        return commit_date
+    except subprocess.CalledProcessError as e:
+        print(f"Error retrieving commit date: {e.stderr}")
+        return None
+    except ValueError as e:
+        print(f"Error parsing date: {e}")
+        return None
+
+def is_commit_within_the_last_target_years(commit_date, years):
+    now = datetime.now(tz=tz.tzlocal())  # Make the current datetime offset-aware
+    years_ago = now - timedelta(days=years * 365)  # Subtract the target years
+    return commit_date >= years_ago
+
 # Example usage
 if __name__ == "__main__":
     with open("data/dataset.csv", mode='r', newline='', encoding='utf-8') as file:
         csv_reader = csv.reader(file)
         next(csv_reader)
+        count = 0
         for line in csv_reader:
-            if len(line[1].split(" ")) < 2 and len(line[4].split(" ")) < 2 and line[1] != '' and line[4] != '':
-                bug = get_diff(line[1], "/home/leusonmario/postdoctoral/projects/mozilla-central")
-                fix = get_diff(line[4], "/home/leusonmario/postdoctoral/projects/mozilla-central")
-                #diff = get_diff_commits(line[1], line[4], "/home/leusonmario/postdoctoral/projects/mozilla-central")
-                if ((count_openai_tokens(bug) + count_openai_tokens(fix)) < 5000) and (len(line[3].split(" ")) < 2) and (line[3] != ''):
-                #if ((count_openai_tokens(fix)) < 5000) and (len(line[3].split(" ")) < 2) and (line[3] != ''):
-                    bug_id = line[3]
-                    bug_mozilla = bugzilla.get(bug_id)
-                    bug_title = bug_mozilla.get(int(bug_id))['summary']
-                    bug_summary = bug_mozilla.get(int(bug_id))['comments'][0]['text']
-                    comments = generate_comments_bug_fix(bug, fix, bug_title, bug_summary)
-                    #comments = generate_comments(fix, bug_title, bug_summary)
-                    print(comments)
+            repo_path = "/home/leusonmario/postdoctoral/projects/mozilla-central"  # Replace with the path to your Mercurial repository
 
-                    valid_json = extract_and_parse_json(comments)
-                    print(valid_json)
-                    write_bug_info_to_csv(bug_id, bug_summary, valid_json)
+            if len(line[1].split(" ")) < 2 and len(line[4].split(" ")) < 2 and line[1] != '' and line[4] != '':
+                fix_commit = line[1]
+                commit_date = get_commit_date(fix_commit, repo_path)
+
+                if commit_date:
+
+                    if is_commit_within_the_last_target_years(commit_date, 10):
+
+                        count += 1
+                        bug = get_diff(line[4], repo_path)
+                        fix = get_diff(line[1], repo_path)
+
+                        if ((count_openai_tokens(bug) + count_openai_tokens(fix)) < 5000) and (
+                                len(line[3].split(" ")) < 2) and (line[3] != ''):
+
+                            bug_id = line[3]
+                            bug_mozilla = bugzilla.get(bug_id)
+
+                            bug_commit = line[4]
+
+                            fix_id = line[0]
+                            fix_mozilla = bugzilla.get(fix_id)
+                            # is_a_recent_bug(bug_mozilla.get(int(bug_id))['creation_time'], 3)
+
+                            #if (is_fix_within_expected_interval(bug_mozilla.get(int(bug_id))['creation_time'],
+                             #                                   fix_mozilla.get(int(fix_id))['creation_time'], 2)):
+                            bug_date = get_commit_date(bug_commit, repo_path)
+                            fix_date = get_commit_date(fix_commit, repo_path)
+
+                            interval_bug_fix = (fix_date - bug_date).days
+
+                            if interval_bug_fix <= 90:
+                                #diff = get_diff_commits(line[1], line[4], "/home/leusonmario/postdoctoral/projects/mozilla-central")
+
+                                bug_title = bug_mozilla.get(int(bug_id))['summary']
+                                bug_summary = bug_mozilla.get(int(bug_id))['comments'][0]['text']
+                                comments = generate_comments_bug_fix(bug, fix, bug_title, bug_summary)
+                                print(comments)
+
+                                if comments is not None:
+                                    valid_json = extract_and_parse_json(comments)
+                                    print(valid_json)
+                                    write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, valid_json, interval_bug_fix)
+
+                                    count += 1
+                                    if count == 50:
+                                        break
+                                else:
+                                    print("No comments were generated.")
+                            else:
+                                print("The commit interval ("+ str(interval_bug_fix) +") was greater than the target number of days.")
+                        else:
+                            print("The commit patch is too large.")
+                    else:
+                        print("The commit was NOT made within the last target years ("+ str(commit_date) +").")
+                else:
+                    print("Could not retrieve the commit date for "+str(fix_commit)+".")
+
+        print("\n\n\n Number of Valid cases " + str(count))
