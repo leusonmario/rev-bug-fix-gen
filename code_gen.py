@@ -33,24 +33,35 @@ CODE_SUMMARIZATION = """
     {patch}
     """
 
-CODE_SUMMARIZATION_DIFF = """
-    You are an expert reviewer for source code, with experience on source code reviews. 
+CODE_SUMMARIZATION_DIFF = """  
+    You are an expert reviewer for source code with extensive experience in analyzing and summarizing code changes.  
 
-    Please, analyze the code provided and report a summarization about the new changes.
-    For that, focus on the differences between the code patch_bug and patch_fix.
-
-    Below, you can find the patch_bug:
-    {patch_bug}
+    The bug below was introduced and later fixed.  
+    **Bug title:** {bug_title}  
+    **Bug description:** {bug_description}
     
-    And now, you can find the patch_fix:
-    {patch_fix}
+    **Fix title:** {fix_title}  
+    **Fix description:** {fix_description}
+
+    Your task is to analyze the provided code and generate a **concise summary focusing strictly on the changes in *patch_fix* that directly resolve the issue introduced by *patch_bug***. 
+    Ignore any modifications unrelated to the bug fix.  
+
+    You must report:  
+    1. The **root cause** of the issue in *patch_bug* (if identifiable).  
+    2. The **specific changes in *patch_fix*** that correct the issue, without mentioning unrelated modifications.  
+
+    **Bug commit message:** {bug_commit_message}  
+    {patch_bug}  
+
+    **Fix commit message:** {fix_commit_message}  
+    {patch_fix}  
     """
 
 FILTERING_COMMENTS = """
     You are an expert reviewer with extensive experience in source code reviews.
 
-    Please analyze the comments below and, based on patch_fixing_the_bug, filter out any comments that are not related to the changes in patch_fixing_the_bug or the issue it addresses. 
-    Note that some comments may reference files not directly modified in patch_fixing_the_bug but could still be relevant if they are logically connected to the addressed issue.
+    Please analyze the comments below and, based on patch_fix, filter out any comments that are not related to the changes in patch_fixing_the_bug or the issue it addresses. 
+    Note that some comments may reference files not directly modified in patch_fix but could still be relevant if they are logically connected to the addressed issue.
     
     Apply the following filters:
     1. Remove comments that focus on documentation, comments, error handling, or requests for tests.
@@ -75,7 +86,7 @@ FILTERING_COMMENTS = """
     Below, you can find the comments:
     {comments}
 
-    And now, you can find the patch_fixing_the_bug:
+    And now, you can find the patch_fix:
     {patch_fix}
     """
 
@@ -119,16 +130,15 @@ CODE_GEN = """
 #This way, based on the changes applied to the patch_fix, you have to raise comments that could be associated with the previous patch_bug.
 
 CODE_GEN_BUG_FIX = """
-    Now, you're asked to generate code review comments for the patch_introducing_the_bug, aiming to avoid the occurrence of the reported bug. 
+    Now, you're asked to generate code review comments for the patch_bug, aiming to avoid the occurrence of the reported bug. 
     
     Guidelines:
-    1. **Objective**: Identify changes in patch_introducing_the_bug that caused the bug and provide actionable feedback to prevent it.
-    2. **Reference**: Use patch_fixing_the_bug only to identify the bug’s cause. Do not reference patch_fixing_the_bug explicitly in your comments.
+    1. **Objective**: Identify changes in patch_bug that caused the bug and provide actionable feedback to prevent it.
+    2. **Reference**: Use patch_fix only to identify the bug’s cause. Do not reference patch_fix explicitly in your comments.
     3. **Exclusions**:
        - Do not comment on unrelated changes (changes not addressing the bug).
-       - Only consider added lines (lines starting with `+` in patch_introducing_the_bug).
-    4. **Context**: Align your review with the issues raised in the bug summarization and Mozilla's source code guidelines.
-    5. **Format**: Write comments in the following JSON format:
+    4. **Context**: Align your review with the issues raised in the bug_summarization and Mozilla's source code guidelines.
+    5. **Format**: Write comments in the following JSON format, considering the patch_bug information:
        ```json
        [
            {{
@@ -140,8 +150,8 @@ CODE_GEN_BUG_FIX = """
        ```
        
     Steps:
-    1. Analyze the changes in patch_introducing_the_bug and the bug summarization.
-    2. Identify potential issues in patch_bug that are addressed in patch_fixing_the_bug.
+    1. Analyze the summary of changes from bug_summarization and the patch_bug.
+    2. For the issues reported in bug_summarization, identify potential issues in patch_bug that are addressed in patch_fix.
     3. Validate each identified problem to ensure it is valid and consistent with the bug summarization.
     4. Exclude comments for changes unrelated to the bug or not in added lines.
     5. Write actionable and concise comments, focusing on code changes, in the JSON format.
@@ -155,11 +165,14 @@ CODE_GEN_BUG_FIX = """
         }}
     ]        
 
-    Below, you can find the patch_introducing_the_bug:
+    Below, you can find the patch_bug:
     {patch_bug}
     
     And now, you can find the patch_fixing_the_bug:
     {patch_fix}
+    
+    And now, you can find the bug_summarization:
+    {bug_summarization}
 
     """
 # Function to read a JSON file
@@ -308,7 +321,8 @@ def check_whether_target_file_is_changed_both_commits(patch_bug, patch_fix):
                 return True
     return False
 
-def generate_comments_bug_fix(patch_bug, patch_fix, bug_title, bug_description):
+def generate_comments_bug_fix(patch_bug, patch_fix, bug_commit_message, fix_commit_message, bug_title,
+                              fix_title, bug_description, fix_description):
     patch_set_bug = PatchSet.from_string(patch_bug)
     formatted_patch_bug = format_patch_set(patch_set_bug)
 
@@ -338,26 +352,19 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_title, bug_description):
         llm=llm
     )
 
-    memory = ConversationBufferMemory()
+    buffer = ConversationBufferMemory()
     conversation_chain = ConversationChain(
         llm=llm,
-        memory=memory,
+        memory=buffer,
     )
-    bug_chain = None #LLMChain(
-    #    prompt=PromptTemplate.from_template(BUG_SUMMARIZATION),
-    #    llm=llm
-    #)
-
-    if bug_chain is not None:
-        output_bug = bug_chain.invoke(
-            {"title": bug_title, "description": bug_description},
-        )["text"]
 
     output_summarization = summarization_chain.invoke(
-        {"patch_bug": formatted_patch_bug, "patch_fix": formatted_patch_fix, },
+        {"patch_bug": formatted_patch_bug, "bug_commit_message":bug_commit_message, "patch_fix": formatted_patch_fix,
+         "fix_commit_message": fix_commit_message, "bug_title": bug_title, "bug_description": bug_description,
+         "fix_title": fix_title, "fix_description": fix_description},
     )["text"]
 
-    memory.save_context(
+    buffer.save_context(
         {
             "input": "You are an expert reviewer for source code, with experience on source code reviews."
         },
@@ -366,38 +373,38 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_title, bug_description):
         },
     )
 
-    memory.save_context(
+    """buffer.save_context(
         {
-            #"input": 'Please, analyze the code provided and report a summarization about the new changes; for that, focus on the code added represented by lines that start with "+".\n'
             "input": 'Please, analyze the code provided and report a summarization about the new changes; for that, focus on the differences between the patch_bug and patch_fix.\n'
                      "patch_bug: " + formatted_patch_bug + "\n\n patch_fix:" + formatted_patch_fix
         },
-        {"output": output_summarization},
-    )
+        {"output": "Bug_summarization: "+ output_summarization},
+    )"""
+    print(output_summarization)
 
-    if bug_chain is not None:
-        memory.save_context(
-            {
-                "input": 'Please, analyze the reported bug below and provide a report about the main issues raised there.\n'
-                        "Bug title: "+ bug_title +
-                        "\n Bug description: "+ bug_description
-            },
-            {"output": output_bug},
-        )
-    else:
-        memory.save_context(
-            {
-                "input": 'Please, make sure that you understand the details of the but reported below. '
-                         'They own relevant information for future tasks. \n'
-                         "Bug title: " + bug_title +
-                         "\n Bug description: " + bug_description
-            },
-            {"output": "Okay, I understood the bug reported."},
-        )
+    """buffer.save_context(
+        {
+            "input": 'Please, make sure that you understand the details of the bug reported below. '
+                     'It has relevant information for future tasks. \n'
+                     "Bug title: " + bug_title +
+                     "\n Bug description: " + bug_description
+        },
+        {"output": "Okay, I understood the details of the bug reported."},
+    )"""
+
+    """buffer.save_context(
+        {
+            "input": 'Please, make sure that you understand the details of the fix patch reported below. '
+                     'It has relevant information for future tasks. \n'
+                     "Fix Patch title: " + fix_title +
+                     "\n Fix description: " + fix_description
+        },
+        {"output": "Okay, I understood the details of the fix patch reported."},
+    )"""
 
     gen_comments = conversation_chain.predict(
         input=CODE_GEN_BUG_FIX.format(
-            patch_fix=formatted_patch_fix, patch_bug=formatted_patch_bug
+            patch_fix=formatted_patch_fix, patch_bug=formatted_patch_bug, bug_summarization=output_summarization
         )
     )
 
@@ -427,7 +434,7 @@ def write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, c
     :param comments_json: A JSON-formatted string or list containing comment details.
     :param output_csv_path: The path to save the output CSV file.
     """
-    output_csv_path = os.path.join('output', 'output-filtering_files_marco_suggestion_1_month_interval.csv')
+    output_csv_path = os.path.join('output', 'output-filtering_files_marco_suggestion_new_prompt.csv')
     try:
         # If comments_json is a string, parse it into a Python list
         if isinstance(comments_json, str):
@@ -671,6 +678,16 @@ def get_commit_date(commit_hash, repo_path='.'):
         print(f"Error parsing date: {e}")
         return None
 
+def get_commit_message(repo_path, commit_hash):
+    command = ['hg', 'log', '-r', commit_hash, '--template', '{desc}']
+
+    result = subprocess.run(command, cwd=repo_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0:
+        raise Exception(f"Error retrieving commit message: {result.stderr}")
+
+    return result.stdout.strip()
+
 def is_commit_within_the_last_target_years(commit_date, years):
     now = datetime.now(tz=tz.tzlocal())  # Make the current datetime offset-aware
     years_ago = now - timedelta(days=years * 365)  # Subtract the target years
@@ -686,48 +703,50 @@ if __name__ == "__main__":
             repo_path = "/home/leusonmario/postdoctoral/projects/mozilla-central"  # Replace with the path to your Mercurial repository
 
             if len(line[1].split(" ")) < 2 and len(line[4].split(" ")) < 2 and line[1] != '' and line[4] != '':
-                fix_commit = line[1]
-                commit_date = get_commit_date(fix_commit, repo_path)
+                fix_commit_hash = line[1]
+                fix_commit_date = get_commit_date(fix_commit_hash, repo_path)
 
-                if commit_date:
+                if fix_commit_date:
 
-                    if is_commit_within_the_last_target_years(commit_date, 10):
+                    if is_commit_within_the_last_target_years(fix_commit_date, 10):
 
                         count += 1
-                        bug = get_diff(line[4], repo_path)
-                        fix = get_diff(line[1], repo_path)
+                        bug_commit_diff = get_diff(line[4], repo_path)
+                        fix_commit_diff = get_diff(line[1], repo_path)
 
-                        if ((count_openai_tokens(bug) + count_openai_tokens(fix)) < 5000) and (
+                        if ((count_openai_tokens(bug_commit_diff) + count_openai_tokens(fix_commit_diff)) < 5000) and (
                                 len(line[3].split(" ")) < 2) and (line[3] != ''):
 
                             bug_id = line[3]
                             bug_mozilla = bugzilla.get(bug_id)
-
-                            bug_commit = line[4]
+                            bug_commit_hash = line[4]
+                            bug_commit_message = get_commit_message(repo_path, bug_commit_hash)
 
                             fix_id = line[0]
                             fix_mozilla = bugzilla.get(fix_id)
-                            # is_a_recent_bug(bug_mozilla.get(int(bug_id))['creation_time'], 3)
+                            fix_commit_message = get_commit_message(repo_path, fix_commit_hash)
 
-                            #if (is_fix_within_expected_interval(bug_mozilla.get(int(bug_id))['creation_time'],
-                             #                                   fix_mozilla.get(int(fix_id))['creation_time'], 2)):
-                            bug_date = get_commit_date(bug_commit, repo_path)
-                            fix_date = get_commit_date(fix_commit, repo_path)
+                            bug_commit_date = get_commit_date(bug_commit_hash, repo_path)
+                            #fix_date = get_commit_date(fix_commit_hash, repo_path)
 
-                            interval_bug_fix = (fix_date - bug_date).days
+                            interval_bug_fix = (fix_commit_date - bug_commit_date).days
 
                             if interval_bug_fix <= 90:
-                                #diff = get_diff_commits(line[1], line[4], "/home/leusonmario/postdoctoral/projects/mozilla-central")
 
-                                bug_title = bug_mozilla.get(int(bug_id))['summary']
+                                bug_patch_title = bug_mozilla.get(int(bug_id))['summary']
                                 bug_summary = bug_mozilla.get(int(bug_id))['comments'][0]['text']
-                                comments = generate_comments_bug_fix(bug, fix, bug_title, bug_summary)
+
+                                fix_patch_title = fix_mozilla.get(int(fix_id))['summary']
+                                fix_summary = fix_mozilla.get(int(fix_id))['comments'][0]['text']
+
+                                comments = generate_comments_bug_fix(bug_commit_diff, fix_commit_diff, bug_commit_message,
+                                                                     fix_commit_message, bug_patch_title, fix_patch_title, bug_summary, fix_summary)
                                 print(comments)
 
                                 if comments is not None:
                                     valid_json = extract_and_parse_json(comments)
                                     print(valid_json)
-                                    write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, valid_json, interval_bug_fix)
+                                    write_bug_info_to_csv(bug_id, bug_commit_hash, fix_id, fix_commit_hash, bug_summary, valid_json, interval_bug_fix)
 
                                     count += 1
                                     if count == 50:
@@ -739,8 +758,8 @@ if __name__ == "__main__":
                         else:
                             print("The commit patch is too large.")
                     else:
-                        print("The commit was NOT made within the last target years ("+ str(commit_date) +").")
+                        print("The commit was NOT made within the last target years (" + str(fix_commit_date) + ").")
                 else:
-                    print("Could not retrieve the commit date for "+str(fix_commit)+".")
+                    print("Could not retrieve the commit date for " + str(fix_commit_hash) + ".")
 
         print("\n\n\n Number of Valid cases " + str(count))
