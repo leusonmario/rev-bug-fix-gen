@@ -36,9 +36,8 @@ CODE_SUMMARIZATION = """
 CODE_SUMMARIZATION_DIFF = """  
     You are an expert reviewer for source code with extensive experience in analyzing and summarizing code changes.  
 
-    The bug below was introduced and later fixed.  
-    **Bug title:** {bug_title}  
-    **Bug description:** {bug_description}
+    The bug associated with the patch_bug was introduced and later fixed.  
+    Below, you can find further information about the fix.
     
     **Fix title:** {fix_title}  
     **Fix description:** {fix_description}
@@ -48,7 +47,7 @@ CODE_SUMMARIZATION_DIFF = """
 
     You must report:  
     1. The **root cause** of the issue in *patch_bug* (if identifiable).  
-    2. The **specific changes in *patch_fix*** that correct the issue, without mentioning unrelated modifications.  
+    2. The **specific changes in *patch_fix*** that correct the issue associated with the fix_description, without mentioning unrelated modifications.  
 
     **Bug commit message:** {bug_commit_message}  
     {patch_bug}  
@@ -60,8 +59,7 @@ CODE_SUMMARIZATION_DIFF = """
 FILTERING_COMMENTS = """
     You are an expert reviewer with extensive experience in source code reviews.
 
-    Please analyze the comments below and, based on patch_fix, filter out any comments that are not related to the changes in patch_fixing_the_bug or the issue it addresses. 
-    Note that some comments may reference files not directly modified in patch_fix but could still be relevant if they are logically connected to the addressed issue.
+    Please analyze the comments below and, based on bug_summarization, filter out any comments that are not related to the changes in patch_bug. 
     
     Apply the following filters:
     1. Remove comments that focus on documentation, comments, error handling, or requests for tests.
@@ -86,8 +84,8 @@ FILTERING_COMMENTS = """
     Below, you can find the comments:
     {comments}
 
-    And now, you can find the patch_fix:
-    {patch_fix}
+    And now, you can find the bug_summarization:
+    {bug_summarization}
     """
 
 BUG_SUMMARIZATION = """
@@ -134,7 +132,7 @@ CODE_GEN_BUG_FIX = """
     
     Guidelines:
     1. **Objective**: Identify changes in patch_bug that caused the bug and provide actionable feedback to prevent it.
-    2. **Reference**: Use patch_fix only to identify the bug’s cause. Do not reference patch_fix explicitly in your comments.
+    2. **Reference**: Use the bug_summarization to identify the bug’s cause.  
     3. **Exclusions**:
        - Do not comment on unrelated changes (changes not addressing the bug).
     4. **Context**: Align your review with the issues raised in the bug_summarization and Mozilla's source code guidelines.
@@ -151,9 +149,9 @@ CODE_GEN_BUG_FIX = """
        
     Steps:
     1. Analyze the summary of changes from bug_summarization and the patch_bug.
-    2. For the issues reported in bug_summarization, identify potential issues in patch_bug that are addressed in patch_fix.
+    2. For the issues reported in bug_summarization, identify potential issues in patch_bug.
     3. Validate each identified problem to ensure it is valid and consistent with the bug summarization.
-    4. Exclude comments for changes unrelated to the bug or not in added lines.
+    4. Exclude comments for changes unrelated to the bug.
     5. Write actionable and concise comments, focusing on code changes, in the JSON format.
     
     As an example, consider:
@@ -167,9 +165,6 @@ CODE_GEN_BUG_FIX = """
 
     Below, you can find the patch_bug:
     {patch_bug}
-    
-    And now, you can find the patch_fixing_the_bug:
-    {patch_fix}
     
     And now, you can find the bug_summarization:
     {bug_summarization}
@@ -414,7 +409,7 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_commit_message, fix_comm
     )
 
     filtered_comments = filtering.invoke(
-        {"patch_fix": formatted_patch_fix, "comments": gen_comments},
+        {"bug_summarization": output_summarization, "comments": gen_comments},
         )["text"]
 
     return filtered_comments
@@ -434,7 +429,7 @@ def write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, c
     :param comments_json: A JSON-formatted string or list containing comment details.
     :param output_csv_path: The path to save the output CSV file.
     """
-    output_csv_path = os.path.join('output', 'output-filtering_files_marco_suggestion_new_prompt.csv')
+    output_csv_path = os.path.join('output-new-prompt', 'output-fix_filtered_dataset.csv')
     try:
         # If comments_json is a string, parse it into a Python list
         if isinstance(comments_json, str):
@@ -695,7 +690,7 @@ def is_commit_within_the_last_target_years(commit_date, years):
 
 # Example usage
 if __name__ == "__main__":
-    with open("data/dataset.csv", mode='r', newline='', encoding='utf-8') as file:
+    with open("data/filtered_dataset.csv", mode='r', newline='', encoding='utf-8') as file:
         csv_reader = csv.reader(file)
         next(csv_reader)
         count = 0
