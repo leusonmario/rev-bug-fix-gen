@@ -1,15 +1,20 @@
+import csv
+import datetime
 import json
 import os
+import sys
+import subprocess
+from datetime import datetime, timedelta
+from dateutil import parser, tz
+import tiktoken
 
 import bugbug.bugzilla as bugzilla
 from langchain.chains.conversation.base import ConversationChain
 from langchain.chains.llm import LLMChain
 from langchain.memory import ConversationBufferMemory
 from langchain_core.prompts import PromptTemplate
-from langchain_openai import OpenAI, ChatOpenAI
+from langchain_openai import ChatOpenAI
 from unidiff import PatchSet
-import csv
-import sys
 
 csv.field_size_limit(sys.maxsize)
 
@@ -34,25 +39,39 @@ CODE_SUMMARIZATION = """
     """
 
 CODE_SUMMARIZATION_DIFF = """  
-    You are an expert reviewer for source code with extensive experience in analyzing and summarizing code changes.  
+    You are an expert reviewer for source code with extensive experience in analyzing and summarizing code changes.
 
-    The bug associated with the patch_bug was introduced and later fixed.  
-    Below, you can find further information about the fix.
+    The bug associated with patch_bug was introduced and later fixed. Below, you can find further information about the fix.
+    Fix title: {fix_title}
+    Fix description: {fix_description}
     
-    **Fix title:** {fix_title}  
-    **Fix description:** {fix_description}
+    Your task:
+    Analyze the provided code and generate a concise summary focusing on the exact changes in patch_bug that introduced the issue and how patch_fix resolved it. Ignore any modifications unrelated to the bug fix.
 
-    Your task is to analyze the provided code and generate a **concise summary focusing strictly on the changes in *patch_fix* that directly resolve the issue introduced by *patch_bug***. 
-    Ignore any modifications unrelated to the bug fix.  
+    You must report:
+    1. The root cause of the issue in `patch_bug`: Identify the specific code lines in patch_bug responsible for the bug. Report the exact affected line and explain why they led to the issue. One single line number for change.
+    2. The specific changes in `patch_fix` that correct the issue: Explain how the bug was resolved, but keep the focus on mapping fixes back to the faulty lines in `patch_bug`.
 
-    You must report:  
-    1. The **root cause** of the issue in *patch_bug* (if identifiable).  
-    2. The **specific changes in *patch_fix*** that correct the issue associated with the fix_description, without mentioning unrelated modifications.  
+    Output Format:
+    Provide a structured response that explicitly maps faulty lines in `patch_bug` to the fix in `patch_fix`, like this:
 
-    **Bug commit message:** {bug_commit_message}  
+    {{
+        "root_cause": {{
+            "filename": "<file_path>",
+            "line": [<line_number>],
+            "explanation": "<Why these lines introduced the bug>"
+        }},
+        "fix": {{
+            "filename": "<file_path>",
+            "line": [<line_number>],
+            "explanation": "<How these changes in patch_fix resolved the issue>"
+        }}
+    }}
+    
+    Bug commit message: {bug_commit_message}  
     {patch_bug}  
 
-    **Fix commit message:** {fix_commit_message}  
+    Fix commit message: {fix_commit_message}  
     {patch_fix}  
     """
 
@@ -125,18 +144,18 @@ CODE_GEN = """
     
     """
 
-#This way, based on the changes applied to the patch_fix, you have to raise comments that could be associated with the previous patch_bug.
-
 CODE_GEN_BUG_FIX = """
-    Now, you're asked to generate code review comments for the patch_bug, aiming to avoid the occurrence of the reported bug. 
-    
-    Guidelines:
-    1. **Objective**: Identify changes in patch_bug that caused the bug and provide actionable feedback to prevent it.
-    2. **Reference**: Use the bug_summarization to identify the bug’s cause.  
+    Now, you're asked to generate code review comments for `patch_bug`, aiming to avoid the occurrence of the reported bug.
+
+    ### Guidelines:
+    1. **Objective**: Identify changes in `patch_bug` that introduced the bug and provide actionable feedback to prevent it.
+    2. **Reference**: Use `bug_summarization` to understand the bug’s cause, but ensure that all comments apply strictly to `patch_bug`.
     3. **Exclusions**:
-       - Do not comment on unrelated changes (changes not addressing the bug).
-    4. **Context**: Align your review with the issues raised in the bug_summarization and Mozilla's source code guidelines.
-    5. **Format**: Write comments in the following JSON format, considering the patch_bug information:
+       - Do **not** comment on changes that appear only in `bug_summarization` but were not present in `patch_bug`.
+       - Do **not** suggest fixes based on changes made in `bug_summarization`. The goal is to improve `patch_bug` to prevent the issue from occurring.
+    4. **Context**: Align your review with the issues raised in `bug_summarization` and Mozilla's source code guidelines.
+    5. **Format**: Write comments in the following JSON format, considering the `patch_bug` information:
+       
        ```json
        [
            {{
@@ -147,50 +166,33 @@ CODE_GEN_BUG_FIX = """
        ] 
        ```
        
-    Steps:
-    1. Analyze the summary of changes from bug_summarization and the patch_bug.
-    2. For the issues reported in bug_summarization, identify potential issues in patch_bug.
-    3. Validate each identified problem to ensure it is valid and consistent with the bug summarization.
+    ### Steps:
+    1. Analyze the summary of changes from `bug_summarization` and `patch_bug`.
+    2. Identify lines in `patch_bug` that could have introduced the bug described in `bug_summarization`.
+    3. Do **not** suggest fixes based on changes in `bug_summarization`. Instead, focus on how `patch_bug` could be improved to avoid the bug.
     4. Exclude comments for changes unrelated to the bug.
-    5. Write actionable and concise comments, focusing on code changes, in the JSON format.
+    5. Write actionable and concise comments, focusing strictly on code changes in `patch_bug`, using the JSON format.
+    6. **Final Check**: Ensure that each comment refers to a line in `patch_bug`, not the changes described in `bug_summarization`.
     
-    As an example, consider:
+    ### Example:
+    
+    ```json
     [
         {{
             \"filename\": \"netwerk/streamconv/converters/mozTXTToHTMLConv.cpp\",
             \"start_line\": 1211,
-            \"content\": \"Consider validating the size of `tempString` to ensure it does not exceed 256 characters. Using `nsAutoStringN<256>` is efficient for small strings, but exceeding the size can lead to buffer issues.\"
+            \"content\": \"The lack of input validation in this line could lead to an unexpected crash. Consider validating `tempString` length before using it.\"
         }}
-    ]        
-
-    Below, you can find the patch_bug:
+    ]
+    ```
+    
+    Below, you can find the `patch_bug`:
     {patch_bug}
     
-    And now, you can find the bug_summarization:
+    And now, you can find the `bug_summarization`:
     {bug_summarization}
 
     """
-# Function to read a JSON file
-def read_json_file(file_path):
-    try:
-        # Open the JSON file and read its raw content
-        with open(file_path, 'r') as file:
-            raw_content = file.read()
-
-            data = []
-            # Try to load the JSON data
-            for one_raw in raw_content.split("\n"):
-                if one_raw != '':
-                    data.append(json.loads(one_raw))
-
-            return data
-    except FileNotFoundError:
-        print(f"The file {file_path} was not found.")
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON from the file {file_path}: {e}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
 
 def get_hunk_with_associated_lines(hunk):
     hunk_with_lines = ""
@@ -228,91 +230,11 @@ def format_patch_set_filtered_files(patch_set, patch_fix):
 
     return output
 
-def generate_comments(patch, bug_title, bug_description):
-    patch_set = PatchSet.from_string(patch)
-    formatted_patch = format_patch_set(patch_set)
-    if formatted_patch == "":
-        return None
-
-    llm = ChatOpenAI(
-        model_name=experiment_metadata["llm_model"],
-        temperature=experiment_metadata["llm_temperature"],
-    )
-
-    summarization_chain = LLMChain(
-        prompt=PromptTemplate.from_template(CODE_SUMMARIZATION),
-        llm=llm
-    )
-
-    bug_chain = None #LLMChain(
-    #    prompt=PromptTemplate.from_template(BUG_SUMMARIZATION),
-    #    llm=llm
-    #)
-
-    if bug_chain is not None:
-        output_bug = bug_chain.invoke(
-            {"title": bug_title, "description": bug_description},
-        )["text"]
-
-    output_summarization = summarization_chain.invoke(
-        {"patch": formatted_patch},
-    )["text"]
-
-    memory = ConversationBufferMemory()
-    conversation_chain = ConversationChain(
-        llm=llm,
-        memory=memory,
-    )
-
-    memory.save_context(
-        {
-            "input": "You are an expert reviewer for source code, with experience on source code reviews."
-        },
-        {
-            "output": "Sure, I can certainly assist with source code reviews."
-        },
-    )
-
-    memory.save_context(
-        {
-            "input": 'Please, analyze the code provided and report a summarization about the new changes; for that, focus on the code added represented by lines that start with "+".\n'
-                     + formatted_patch
-        },
-        {"output": output_summarization},
-    )
-
-    if bug_chain is not None:
-        memory.save_context(
-            {
-                "input": 'Please, analyze the reported bug below and provide a report about the main issues raised there.\n'
-                        "Bug title: "+ bug_title +
-                        "\n Bug description: "+ bug_description
-            },
-            {"output": output_bug},
-        )
-    else:
-        memory.save_context(
-            {
-                "input": 'Please, make sure that you understand the details of the but reported below. '
-                         'They own relevant information for future tasks. \n'
-                         "Bug title: " + bug_title +
-                         "\n Bug description: " + bug_description
-            },
-            {"output": "Okay, I understood the bug reported."},
-        )
-
-    gen_comments = conversation_chain.predict(
-        input=CODE_GEN.format(
-            patch=formatted_patch
-        )
-    )
-
-    return gen_comments
-
 def check_whether_target_file_is_changed_both_commits(patch_bug, patch_fix):
     for changed_file_fix in patch_fix.modified_files:
         for changed_file_bug in patch_bug.modified_files:
-            if changed_file_bug.path == changed_file_fix.path:
+            #print(changed_file_bug)
+            if changed_file_bug.is_binary_file is False and changed_file_fix.is_binary_file is False and changed_file_bug.path == changed_file_fix.path:
                 return True
     return False
 
@@ -414,22 +336,8 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_commit_message, fix_comm
 
     return filtered_comments
 
-
-import csv
-import os
-import json
-
-
-def write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, comments_json, interval_bug_fix):
-    """
-    Converts bug information and comments from JSON format to a CSV file.
-
-    :param bug_id: The ID of the bug.
-    :param bug_summary: The summary of the bug.
-    :param comments_json: A JSON-formatted string or list containing comment details.
-    :param output_csv_path: The path to save the output CSV file.
-    """
-    output_csv_path = os.path.join('output-new-prompt', 'output-fix_filtered_dataset.csv')
+def write_bug_info_to_csv(bug_id, bug_commit, bug_tokens, fix_id, fix_commit, fix_tokens, bug_summary, comments_json, interval_bug_fix):
+    output_csv_path = os.path.join(config.REPORT_DIRECTORY, config.REPORT_FILENAME)
     try:
         # If comments_json is a string, parse it into a Python list
         if isinstance(comments_json, str):
@@ -438,7 +346,7 @@ def write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, c
             comments = comments_json
 
         # Define the headers for the CSV file
-        headers = ["Bug ID", "Bug Commit", "Fix ID", "Fix Commit", "Bug Summary", "Interval Bug-Fix", "Filename", "Start Line", "Comment Content"]
+        headers = ["Bug ID", "Bug Commit", "TokensBug", "Fix ID", "Fix Commit", "TokensFix", "Bug Summary", "Interval Bug-Fix", "Filename", "Start Line", "Comment Content"]
 
         if not os.path.exists(output_csv_path):
             with open(output_csv_path, mode='a+', newline='', encoding='utf-8') as csv_file:
@@ -454,8 +362,10 @@ def write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, c
                 writer.writerow({
                     "Bug ID": bug_id,
                     "Bug Commit": bug_commit,
+                    "TokensBug": bug_tokens,
                     "Fix ID": fix_id,
                     "Fix Commit": fix_commit,
+                    "TokensFix": fix_tokens,
                     "Bug Summary": bug_summary,
                     "Interval Bug-Fix" : interval_bug_fix,
                     "Filename": comment.get("filename", ""),
@@ -465,50 +375,6 @@ def write_bug_info_to_csv(bug_id, bug_commit, fix_id, fix_commit, bug_summary, c
         print(f"CSV file has been successfully written to {output_csv_path}.")
     except Exception as e:
         print(f"An error occurred: {e}")
-
-def generate_output(bug_id, bug_summary, comments_json):
-    # Ensure the directory exists
-    os.makedirs('output', exist_ok=True)
-
-    # Define the file path
-    file_path = os.path.join('output', 'output.csv')
-
-    # Parse the comments from the raw JSON string
-    comments = []
-    try:
-        comments_data = json.loads(comments_json)  # Parse the raw JSON string into a Python list
-        comments = [comment_data['comment'] for comment_data in comments_data]  # Extract comments
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"Error parsing JSON data: {e}")
-        return
-
-    # Combine all comments into one string with a newline separator
-    combined_comments = "\n".join(comments)
-
-    # Ensure bug summary and comments are properly escaped for CSV
-    bug_summary_escaped = bug_summary.replace('"', '""')
-    combined_comments_escaped = combined_comments.replace('"', '""')
-
-    # Prepare the data to write (Bug ID, Bug Summary, and Combined Comments)
-    data = [(bug_id, bug_summary_escaped, combined_comments_escaped)]
-
-    # Check if the file already exists
-    file_exists = os.path.exists(file_path)
-
-    # Open the CSV file (append mode if exists)
-    with open(file_path, mode='a', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file, quotechar='"', quoting=csv.QUOTE_MINIMAL)
-
-        # If file doesn't exist, write the header
-        if not file_exists:
-            writer.writerow(['Bug ID', 'Bug Summary', 'Comments'])
-
-        # Write the data (bug ID, summary, and comments)
-        writer.writerows(data)
-
-    print(f"CSV file saved at: {file_path}")
-
-import datetime
 
 def compare_commit_dates(bug_date, fix_date, interval_days: int) -> bool:
 
@@ -559,8 +425,6 @@ def get_diff_commits(commit_bug, commit_fix, repo_path):
     except Exception as e:
         print(f"An error occurred: {e}")
         return None
-
-import tiktoken
 
 def count_openai_tokens(log, model='gpt-3.5-turbo'):
     model_to_encoding = {
@@ -614,44 +478,6 @@ def extract_and_parse_json(input_string):
     except json.JSONDecodeError as e:
         raise ValueError(f"Failed to parse JSON: {e}")
 
-from datetime import datetime, timedelta
-
-def is_a_recent_bug(creation_date: str, diff_year: int) -> bool:
-    try:
-        # Parse the creation date from the string
-        bug_date = datetime.strptime(creation_date, "%Y-%m-%dT%H:%M:%SZ")
-
-        # Calculate the date two years ago from today
-        supported_date = datetime.utcnow() - timedelta(days=diff_year*365)
-
-        # Check if the bug was created within the last two years
-        return bug_date >= supported_date
-    except ValueError:
-        # Return False if the date format is invalid
-        return False
-
-def is_fix_within_expected_interval(report_date: str, fix_date: str, interval: int) -> bool:
-    try:
-        # Parse the report and fix dates from the strings
-        report_datetime = datetime.strptime(report_date, "%Y-%m-%dT%H:%M:%SZ")
-        fix_datetime = datetime.strptime(fix_date, "%Y-%m-%dT%H:%M:%SZ")
-
-        # Calculate the six-month threshold
-        six_months_after_report = report_datetime + timedelta(days=30*interval)  # Approximate six months as 180 days
-
-        # Check if the fix date is within six months of the report date
-        if fix_datetime <= six_months_after_report and fix_datetime > report_datetime:
-            return True
-        else:
-            return False
-    except ValueError:
-        # Return False if the date format is invalid
-        return False
-
-import subprocess
-from datetime import datetime, timedelta
-from dateutil import parser, tz
-
 def get_commit_date(commit_hash, repo_path='.'):
     try:
         # Run the hg log command to get the commit date
@@ -690,12 +516,12 @@ def is_commit_within_the_last_target_years(commit_date, years):
 
 # Example usage
 if __name__ == "__main__":
-    with open("data/filtered_dataset.csv", mode='r', newline='', encoding='utf-8') as file:
+    with open(config.INPUT_FILE, mode='r', newline='', encoding='utf-8') as file:
         csv_reader = csv.reader(file)
         next(csv_reader)
         count = 0
         for line in csv_reader:
-            repo_path = "/home/leusonmario/postdoctoral/projects/mozilla-central"  # Replace with the path to your Mercurial repository
+            repo_path = config.LOCAL_MERCURIAL_PATH
 
             if len(line[1].split(" ")) < 2 and len(line[4].split(" ")) < 2 and line[1] != '' and line[4] != '':
                 fix_commit_hash = line[1]
@@ -708,6 +534,9 @@ if __name__ == "__main__":
                         count += 1
                         bug_commit_diff = get_diff(line[4], repo_path)
                         fix_commit_diff = get_diff(line[1], repo_path)
+
+                        bug_count_tokens = count_openai_tokens(bug_commit_diff)
+                        fix_count_tokens = count_openai_tokens(fix_commit_diff)
 
                         if ((count_openai_tokens(bug_commit_diff) + count_openai_tokens(fix_commit_diff)) < 5000) and (
                                 len(line[3].split(" ")) < 2) and (line[3] != ''):
@@ -741,7 +570,8 @@ if __name__ == "__main__":
                                 if comments is not None:
                                     valid_json = extract_and_parse_json(comments)
                                     print(valid_json)
-                                    write_bug_info_to_csv(bug_id, bug_commit_hash, fix_id, fix_commit_hash, bug_summary, valid_json, interval_bug_fix)
+                                    write_bug_info_to_csv(bug_id, bug_commit_hash, bug_count_tokens, fix_id, fix_commit_hash,
+                                                          fix_count_tokens, bug_summary, valid_json, interval_bug_fix)
 
                                     count += 1
                                     if count == 50:
