@@ -32,14 +32,6 @@ if config.OPEN_API_KEY:
 else:
     raise Exception("OPEN_API_KEY is not set")
 
-CODE_SUMMARIZATION = """
-    You are an expert reviewer for source code, with experience on source code reviews. 
-    
-    Please, analyze the code provided and report a summarization about the new changes; for that, focus on the coded added represented by lines that start with "+".
-    
-    {patch}
-    """
-
 CODE_SUMMARIZATION_DIFF = """  
     You are an expert reviewer for source code with extensive experience in analyzing and summarizing code changes.
 
@@ -109,43 +101,6 @@ FILTERING_COMMENTS = """
 
     And now, you can find the commit diff:
     {bug_summarization}
-    """
-
-BUG_SUMMARIZATION = """
-    You also have worked on reporting bugs on the scope of Mozilla projects. 
-    
-    Please, analyze the bug description provided and report a summarization of the main issues reported in the bug.
-    
-    Bug Title: {title}
-    
-    Bug Description: 
-    {description}  
-"""
-
-CODE_GEN = """
-    Now, you're asked to generate code review comments for the current patch, aiming to avoid the occurrence of the reported bug. 
-    This way, based on the changes applied to the patch below, you have to raise comments that could be associated with the previous bug report. 
-    These comments should guide developers to fix the bug in advance focusing on the code changes. Do not consider added comments.  
-    
-    1. Understand the changes done in the patch by reasoning about the patch and bug summarization as previously reported.
-    2. Identify possible code snippets that might associated with the issues raised in the bug summarization and similar concerns.
-    3. Reason about each identified problem to make sure they are valid and cover the issues raised in the bug summarization. Have in mind, your review must be consistent with the source code in Mozilla.
-    4. Filter out comments that focuses on documentation, comments, error handling, tests, and confirmation whether objects, methods and files exist or not.
-    5. Filter out comments that are descriptive.
-    6. Filter out comments that are praising (example: "This is a good addition to the code.").
-    7. Filter out comments that are not about added lines (have '+' symbol at the start of the line).
-    8. Final answer: Write down the comments and report them using the JSON format previously adopted for the valid comment examples.
-
-    As an example, consider:
-    comment: 
-        "filename": "netwerk/streamconv/converters/mozTXTToHTMLConv.cpp",
-        "start_line": 1211,
-        "content": "You are using `nsAutoStringN<256>` instead of `nsString`. This is a good change as `nsAutoStringN<256>` is more efficient for small strings. However, you should ensure that the size of `tempString` does not exceed 256 characters, as `nsAutoStringN<256>` has a fixed size."
-    
-    Here is the patch that we need you to review:
-    {patch}
-    
-    
     """
 
 CODE_GEN_BUG_FIX = """
@@ -237,7 +192,6 @@ def format_patch_set_filtered_files(patch_set, patch_fix):
 def check_whether_target_file_is_changed_both_commits(patch_bug, patch_fix):
     for changed_file_fix in patch_fix.modified_files:
         for changed_file_bug in patch_bug.modified_files:
-            #print(changed_file_bug)
             if changed_file_bug.is_binary_file is False and changed_file_fix.is_binary_file is False and changed_file_bug.path == changed_file_fix.path:
                 return True
     return False
@@ -315,7 +269,6 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_commit_message, fix_comm
 
     if filtered_comments_gpt is not None:
         filtered_comments_deepseek = filter_with_deepseek.filter_comments_using_deepseek(gen_comments, formatted_patch_fix)
-        print(filtered_comments_deepseek)
 
     return [filtered_comments_gpt, filtered_comments_deepseek]
 
@@ -327,7 +280,6 @@ def write_bug_info_to_csv(bug_id, bug_commit, bug_tokens, fix_id, fix_commit, fi
         else:
             comments = comments_json
 
-        # Define the headers for the CSV file
         headers = ["Bug ID", "Bug Commit", "TokensBug", "Fix ID", "Fix Commit", "TokensFix", "Bug Summary", "Interval Bug-Fix", "Filename", "Start Line", "Comment Content"]
 
         if not os.path.exists(output_csv_path):
@@ -366,42 +318,14 @@ def compare_commit_dates(bug_date, fix_date, interval_days: int) -> bool:
 
 def get_diff(commit, repo_path):
     try:
-        # Build the Mercurial diff command
         cmd = ["hg", "diff", "-c", commit]
 
-        #repo_path = os.path.abspath(repo_path)
-
-        # Run the command in the specified repository path
         result = subprocess.run(cmd, cwd=repo_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        # Check for errors
         if result.returncode != 0:
             print(f"Error: {result.stderr}")
             return None
 
-        # Return the diff output
-        return result.stdout
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return None
-
-def get_diff_commits(commit_bug, commit_fix, repo_path):
-    try:
-        # Build the Mercurial diff command
-        cmd = ["hg", "diff", "-r", commit_bug, "-r", commit_fix, repo_path]
-
-        #repo_path = os.path.abspath(repo_path)
-
-        # Run the command in the specified repository path
-        result = subprocess.run(cmd, cwd=repo_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-        # Check for errors
-        if result.returncode != 0:
-            print(f"Error: {result.stderr}")
-            return None
-
-        # Return the diff output
         return result.stdout
 
     except Exception as e:
@@ -477,11 +401,10 @@ def get_commit_message(repo_path, commit_hash):
     return result.stdout.strip()
 
 def is_commit_within_the_last_target_years(commit_date, years):
-    now = datetime.now(tz=tz.tzlocal())  # Make the current datetime offset-aware
-    years_ago = now - timedelta(days=years * 365)  # Subtract the target years
+    now = datetime.now(tz=tz.tzlocal())
+    years_ago = now - timedelta(days=years * 365)
     return commit_date >= years_ago
 
-# Example usage
 if __name__ == "__main__":
     with (open(config.INPUT_FILE, mode='r', newline='', encoding='utf-8') as file):
         csv_reader = list(csv.reader(file))  # Read all lines into a list
@@ -534,16 +457,12 @@ if __name__ == "__main__":
                                 comments = output[0]
                                 filtered_deepseek = output[1]
 
-                                print(comments)
-
                                 if comments is not None:
                                     valid_json = extract_and_parse_json(comments)
-                                    print(valid_json)
                                     write_bug_info_to_csv(bug_id, bug_commit_hash, bug_count_tokens, fix_id, fix_commit_hash,
                                                           fix_count_tokens, bug_summary, valid_json, interval_bug_fix)
                                 if filtered_deepseek is not None:
                                     valid_json = extract_and_parse_json(filtered_deepseek)
-                                    print(valid_json)
                                     write_bug_info_to_csv(str(bug_id)+"DEEP", bug_commit_hash, bug_count_tokens, fix_id,
                                                           fix_commit_hash,
                                                           fix_count_tokens, bug_summary, valid_json, interval_bug_fix)
