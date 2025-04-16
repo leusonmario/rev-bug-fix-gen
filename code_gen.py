@@ -2,19 +2,21 @@ import csv
 import datetime
 import json
 import os
-import sys
 import subprocess
+import sys
 from datetime import datetime, timedelta
-from dateutil import parser, tz
-import tiktoken
 
 import bugbug.bugzilla as bugzilla
+import tiktoken
+from dateutil import parser, tz
 from langchain.chains.conversation.base import ConversationChain
 from langchain.chains.llm import LLMChain
 from langchain.memory import ConversationBufferMemory
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from unidiff import PatchSet
+
+import filter_with_deepseek
 
 csv.field_size_limit(sys.maxsize)
 
@@ -78,16 +80,18 @@ CODE_SUMMARIZATION_DIFF = """
 FILTERING_COMMENTS = """
     You are an expert reviewer with extensive experience in source code reviews.
 
-    Please analyze the comments below and, based on bug_summarization, filter out any comments that are not related to the changes in patch_bug. 
+    Please analyze the comments below and filter out any comments that are not related to the changes applied in the commit diff.  
     
     Apply the following filters:
     1. Remove comments that focus on documentation, comments, error handling, or requests for tests.
-    2. Remove comments that suggest developers double-check their implementations (e.g., verifying the existence, initialization, or creation of objects, methods, or files) without providing actionable feedback.
+    2. Remove comments that suggest developers to double-check or ensure their implementations (e.g., verifying the existence, initialization, or creation of objects, methods, or files) without providing actionable feedback.
     3. Remove comments that are purely descriptive and do not suggest improvements or highlight problems.
     4. Remove comments that are solely praising (e.g., "This is a good addition to the code.").
     5. Consolidate duplicate comments that address the same issue into a single, comprehensive comment.
+    6. Do not change the contents of the comments.
     
-    At the end, return a single JSON file containing the valid comments. 
+    Output:
+    Return a single JSON file containing the valid comments, and no additional content. 
     Ensure the output format matches the example below:
     
     Example:
@@ -103,7 +107,7 @@ FILTERING_COMMENTS = """
     Below, you can find the comments:
     {comments}
 
-    And now, you can find the bug_summarization:
+    And now, you can find the commit diff:
     {bug_summarization}
     """
 
@@ -290,34 +294,7 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_commit_message, fix_comm
         },
     )
 
-    """buffer.save_context(
-        {
-            "input": 'Please, analyze the code provided and report a summarization about the new changes; for that, focus on the differences between the patch_bug and patch_fix.\n'
-                     "patch_bug: " + formatted_patch_bug + "\n\n patch_fix:" + formatted_patch_fix
-        },
-        {"output": "Bug_summarization: "+ output_summarization},
-    )"""
     print(output_summarization)
-
-    """buffer.save_context(
-        {
-            "input": 'Please, make sure that you understand the details of the bug reported below. '
-                     'It has relevant information for future tasks. \n'
-                     "Bug title: " + bug_title +
-                     "\n Bug description: " + bug_description
-        },
-        {"output": "Okay, I understood the details of the bug reported."},
-    )"""
-
-    """buffer.save_context(
-        {
-            "input": 'Please, make sure that you understand the details of the fix patch reported below. '
-                     'It has relevant information for future tasks. \n'
-                     "Fix Patch title: " + fix_title +
-                     "\n Fix description: " + fix_description
-        },
-        {"output": "Okay, I understood the details of the fix patch reported."},
-    )"""
 
     gen_comments = conversation_chain.predict(
         input=CODE_GEN_BUG_FIX.format(
@@ -330,16 +307,21 @@ def generate_comments_bug_fix(patch_bug, patch_fix, bug_commit_message, fix_comm
         llm=llm
     )
 
-    filtered_comments = filtering.invoke(
-        {"bug_summarization": output_summarization, "comments": gen_comments},
+    filtered_comments_gpt = filtering.invoke(
+        {"bug_summarization": formatted_patch_fix, "comments": gen_comments},
         )["text"]
 
-    return filtered_comments
+    filtered_comments_deepseek = None
+
+    if filtered_comments_gpt is not None:
+        filtered_comments_deepseek = filter_with_deepseek.filter_comments_using_deepseek(gen_comments, formatted_patch_fix)
+        print(filtered_comments_deepseek)
+
+    return [filtered_comments_gpt, filtered_comments_deepseek]
 
 def write_bug_info_to_csv(bug_id, bug_commit, bug_tokens, fix_id, fix_commit, fix_tokens, bug_summary, comments_json, interval_bug_fix):
     output_csv_path = os.path.join(config.REPORT_DIRECTORY, config.REPORT_FILENAME)
     try:
-        # If comments_json is a string, parse it into a Python list
         if isinstance(comments_json, str):
             comments = json.loads(comments_json)
         else:
@@ -436,15 +418,12 @@ def count_openai_tokens(log, model='gpt-3.5-turbo'):
         'ada': 'p50k_base',
     }
 
-    # Get the encoding for the specified model
     encoding_name = model_to_encoding.get(model)
     if not encoding_name:
         raise ValueError(f"Unsupported model: {model}")
 
-    # Load the tokenizer
     enc = tiktoken.get_encoding(encoding_name)
 
-    # Encode the log and count tokens
     try:
         tokens = enc.encode(log)
         return len(tokens)
@@ -454,25 +433,15 @@ def count_openai_tokens(log, model='gpt-3.5-turbo'):
 
 
 def extract_and_parse_json(input_string):
-    """
-    Extracts the content between the first '[' and the last ']', and parses it as JSON.
-
-    :param input_string: The JSON-like input string.
-    :return: Parsed JSON object (list or dictionary).
-    """
     try:
-        # Find the indices of the first '[' and the last ']'
         start_index = input_string.find('[')
         end_index = input_string.rfind(']')
 
-        # Ensure both '[' and ']' are present
         if start_index == -1 or end_index == -1 or start_index > end_index:
             raise ValueError("Invalid JSON format: Missing or misaligned brackets.")
 
-        # Extract the content within the brackets
         json_content = input_string[start_index:end_index + 1]
 
-        # Parse the extracted content as JSON
         parsed_json = json.loads(json_content)
         return parsed_json
     except json.JSONDecodeError as e:
@@ -480,7 +449,6 @@ def extract_and_parse_json(input_string):
 
 def get_commit_date(commit_hash, repo_path='.'):
     try:
-        # Run the hg log command to get the commit date
         result = subprocess.run(
             ["hg", "log", "-r", commit_hash, "--template", "{date|isodate}"],
             cwd=repo_path,
@@ -489,7 +457,6 @@ def get_commit_date(commit_hash, repo_path='.'):
             check=True
         )
         commit_date_str = result.stdout.strip()
-        # Use dateutil.parser to parse the date string with timezone
         commit_date = parser.parse(commit_date_str)
         return commit_date
     except subprocess.CalledProcessError as e:
@@ -516,11 +483,11 @@ def is_commit_within_the_last_target_years(commit_date, years):
 
 # Example usage
 if __name__ == "__main__":
-    with open(config.INPUT_FILE, mode='r', newline='', encoding='utf-8') as file:
-        csv_reader = csv.reader(file)
-        next(csv_reader)
+    with (open(config.INPUT_FILE, mode='r', newline='', encoding='utf-8') as file):
+        csv_reader = list(csv.reader(file))  # Read all lines into a list
         count = 0
-        for line in csv_reader:
+        #for line in reversed(csv_reader[1:]):
+        for line in csv_reader[2:]:
             repo_path = config.LOCAL_MERCURIAL_PATH
 
             if len(line[1].split(" ")) < 2 and len(line[4].split(" ")) < 2 and line[1] != '' and line[4] != '':
@@ -538,7 +505,7 @@ if __name__ == "__main__":
                         bug_count_tokens = count_openai_tokens(bug_commit_diff)
                         fix_count_tokens = count_openai_tokens(fix_commit_diff)
 
-                        if ((count_openai_tokens(bug_commit_diff) + count_openai_tokens(fix_commit_diff)) < 5000) and (
+                        if (fix_count_tokens < 4000) and (
                                 len(line[3].split(" ")) < 2) and (line[3] != ''):
 
                             bug_id = line[3]
@@ -551,20 +518,22 @@ if __name__ == "__main__":
                             fix_commit_message = get_commit_message(repo_path, fix_commit_hash)
 
                             bug_commit_date = get_commit_date(bug_commit_hash, repo_path)
-                            #fix_date = get_commit_date(fix_commit_hash, repo_path)
 
                             interval_bug_fix = (fix_commit_date - bug_commit_date).days
 
-                            if interval_bug_fix <= 90:
+                            bug_patch_title = bug_mozilla.get(int(bug_id))['summary']
+                            bug_summary = bug_mozilla.get(int(bug_id))['comments'][0]['text']
 
-                                bug_patch_title = bug_mozilla.get(int(bug_id))['summary']
-                                bug_summary = bug_mozilla.get(int(bug_id))['comments'][0]['text']
+                            fix_patch_title = fix_mozilla.get(int(fix_id))['summary']
+                            fix_summary = fix_mozilla.get(int(fix_id))['comments'][0]['text']
 
-                                fix_patch_title = fix_mozilla.get(int(fix_id))['summary']
-                                fix_summary = fix_mozilla.get(int(fix_id))['comments'][0]['text']
+                            output = generate_comments_bug_fix(bug_commit_diff, fix_commit_diff, bug_commit_message,
+                                                                 fix_commit_message, bug_patch_title, fix_patch_title, bug_summary, fix_summary)
 
-                                comments = generate_comments_bug_fix(bug_commit_diff, fix_commit_diff, bug_commit_message,
-                                                                     fix_commit_message, bug_patch_title, fix_patch_title, bug_summary, fix_summary)
+                            if output is not None and len(output) > 1:
+                                comments = output[0]
+                                filtered_deepseek = output[1]
+
                                 print(comments)
 
                                 if comments is not None:
@@ -572,14 +541,18 @@ if __name__ == "__main__":
                                     print(valid_json)
                                     write_bug_info_to_csv(bug_id, bug_commit_hash, bug_count_tokens, fix_id, fix_commit_hash,
                                                           fix_count_tokens, bug_summary, valid_json, interval_bug_fix)
+                                if filtered_deepseek is not None:
+                                    valid_json = extract_and_parse_json(filtered_deepseek)
+                                    print(valid_json)
+                                    write_bug_info_to_csv(str(bug_id)+"DEEP", bug_commit_hash, bug_count_tokens, fix_id,
+                                                          fix_commit_hash,
+                                                          fix_count_tokens, bug_summary, valid_json, interval_bug_fix)
 
                                     count += 1
                                     if count == 50:
                                         break
                                 else:
                                     print("No comments were generated.")
-                            else:
-                                print("The commit interval ("+ str(interval_bug_fix) +") was greater than the target number of days.")
                         else:
                             print("The commit patch is too large.")
                     else:
